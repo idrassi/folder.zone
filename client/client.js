@@ -58,10 +58,12 @@ class FolderShare {
 		this.roomId = null
 		this.cryptoKey = null
 		this.signaling = null
+		this.hostPeerId = null
 		this.peers = new Map()
 		this.files = []
 		this.allowWrite = false
 		this.pendingDownloads = new Map()
+		this.pendingUploadProgress = new Set()
 		this.currentPath = ""
 		this.folderName = ""
 		this.uploadRateLimiter = new RateLimiter(UPLOAD_LIMITS.rateLimitPerMinute)
@@ -294,6 +296,37 @@ class FolderShare {
 		document.getElementById("qr-modal").hidden = true
 	}
 
+	_getHostConnection() {
+		if (!this.hostPeerId) return null
+		return this.peers.get(this.hostPeerId) || null
+	}
+
+	_handleHostDisconnected() {
+		this.hostPeerId = null
+		updateConnectionStatus("disconnected")
+
+		// Cancel any in-flight downloads so they don't hang indefinitely.
+		for (const [, download] of this.pendingDownloads) {
+			try {
+				removeProgressItem(download.progressId, "download")
+			} catch {}
+			if (download.onComplete) {
+				try {
+					download.onComplete()
+				} catch {}
+			}
+		}
+		this.pendingDownloads.clear()
+
+		// Cancel any in-flight uploads so they don't hang indefinitely
+		for (const progressId of this.pendingUploadProgress) {
+			try {
+				removeProgressItem(progressId, "upload")
+			} catch {}
+		}
+		this.pendingUploadProgress.clear()
+	}
+
 	handleSignalingMessage(msg, isHost) {
 		switch (msg.type) {
 			case "peer-joined": {
@@ -310,13 +343,16 @@ class FolderShare {
 				break
 			}
 			case "peer-left": {
+				const wasHost = !this.isHost && this.hostPeerId && msg.peerId === this.hostPeerId
 				const pc = this.peers.get(msg.peerId)
 				if (pc) {
 					pc.close()
 					this.peers.delete(msg.peerId)
 				}
 				updatePeerCount(this.peers.size)
-				if (!this.isHost && this.peers.size === 0) {
+				if (wasHost) {
+					this._handleHostDisconnected()
+				} else if (!this.isHost && this.peers.size === 0) {
 					updateConnectionStatus("disconnected")
 				}
 				break
@@ -341,7 +377,8 @@ class FolderShare {
 	handleConnectionState(peerId, state) {
 		const isConnected = state === "connected" || state === "connected (relay)"
 
-		if (!this.isHost && isConnected) {
+		// Peer UI should reflect the host connection only
+		if (!this.isHost && isConnected && this.hostPeerId && peerId === this.hostPeerId) {
 			updateConnectionStatus(state, state === "connected (relay)")
 		}
 		if (isConnected && this.isHost) {
@@ -352,6 +389,9 @@ class FolderShare {
 	async handlePeerMessage(peerId, msg) {
 		switch (msg.type) {
 			case "file-list":
+				// Host never accepts file lists: peers treat the sender as the host
+				if (this.isHost) return
+
 				if (!Array.isArray(msg.files)) {
 					console.warn("Invalid file list received")
 					return
@@ -360,6 +400,21 @@ class FolderShare {
 					showError(`File list too large (${msg.files.length} files, max ${FILE_LIST_LIMITS.maxFiles})`)
 					return
 				}
+
+				// First file-list sender is authoritative host for this peer session
+				if (!this.hostPeerId) {
+					this.hostPeerId = peerId
+
+					// If the host connection is already established, reflect it in UI
+					const hostPc = this.peers.get(this.hostPeerId)
+					if (hostPc && hostPc.connected) {
+						updateConnectionStatus(hostPc.useRelay ? "connected (relay)" : "connected", !!hostPc.useRelay)
+					}
+				} else if (peerId !== this.hostPeerId) {
+					// Ignore non-host file lists
+					return
+				}
+
 				this.files = msg.files
 				this.allowWrite = msg.allowWrite
 				renderPeerFiles(
@@ -374,24 +429,40 @@ class FolderShare {
 				updateStatusText("peer-status-text", "Ready")
 				break
 			case "file-request":
+				// Only the host serves files
+				if (!this.isHost) return
 				await this.handleFileRequest(peerId, msg.path)
 				break
 			case "file-chunk":
+				// Peers only accept transfer data from the host
+				if (!this.isHost) {
+					if (!this.hostPeerId || peerId !== this.hostPeerId) return
+				}
 				this.handleFileChunk(msg)
 				break
 			case "file-complete":
+				if (!this.isHost) {
+					if (!this.hostPeerId || peerId !== this.hostPeerId) return
+				}
 				await this.handleFileComplete(msg)
 				break
 			case "upload-start":
+				// Only the host accepts uploads
+				if (!this.isHost) return
 				this.handleUploadStart(peerId, msg)
 				break
 			case "upload-chunk":
+				if (!this.isHost) return
 				this.handleUploadChunk(peerId, msg)
 				break
 			case "upload-complete":
+				if (!this.isHost) return
 				await this.handleUploadComplete(peerId, msg)
 				break
 			case "upload-response":
+				// Peers only accept upload responses from the host
+				if (this.isHost) return
+				if (!this.hostPeerId || peerId !== this.hostPeerId) return
 				this.handleUploadResponse(msg)
 				break
 		}
@@ -420,15 +491,15 @@ class FolderShare {
 			showError(`File too large (max ${formatSize(MAX_FILE_SIZE)})`)
 			return
 		}
+		const pc = this._getHostConnection()
+		if (!pc) {
+			showError("Host disconnected")
+			return
+		}
 		const fileName = path.split("/").pop()
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 		createProgressItem(progressId, fileName, file ? file.size : 0, "download")
-		for (const [, pc] of this.peers) {
-			pc.send({
-				type: "file-request",
-				path,
-			})
-		}
+		pc.send({ type: "file-request", path })
 		this.pendingDownloads.set(path, {
 			chunks: [],
 			received: 0,
@@ -469,15 +540,16 @@ class FolderShare {
 			if (onComplete) onComplete()
 			return
 		}
+		const pc = this._getHostConnection()
+		if (!pc) {
+			showError("Host disconnected")
+			if (onComplete) onComplete()
+			return
+		}
 		const fileName = path.split("/").pop()
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 		createProgressItem(progressId, fileName, file ? file.size : 0, "download")
-		for (const [, pc] of this.peers) {
-			pc.send({
-				type: "file-request",
-				path,
-			})
-		}
+		pc.send({ type: "file-request", path })
 		this.pendingDownloads.set(path, {
 			chunks: [],
 			received: 0,
@@ -707,6 +779,7 @@ class FolderShare {
 
 	handleUploadResponse(msg) {
 		const progressId = msg.progressId || msg.path.replace(/[^a-zA-Z0-9]/g, "_")
+		this.pendingUploadProgress.delete(progressId)
 		if (msg.success) {
 			setProgressVerified(progressId, true, "upload")
 			showUploadResponse(true, msg.message)
@@ -720,6 +793,11 @@ class FolderShare {
 
 	async uploadFile(file, targetPath = "") {
 		if (!file) return
+		const pc = this._getHostConnection()
+		if (!pc) {
+			showUploadResponse(false, "Host disconnected")
+			return
+		}
 		const path = targetPath || file.name
 		if (!isValidUploadPath(path)) {
 			showUploadResponse(false, "Invalid filename")
@@ -731,25 +809,16 @@ class FolderShare {
 		}
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`
 		createProgressItem(progressId, path.split("/").pop(), file.size, "upload")
+		this.pendingUploadProgress.add(progressId)
 		const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
-		for (const [, pc] of this.peers) {
-			await pc.send({
-				type: "upload-start",
-				path,
-				size: file.size,
-				totalChunks,
-				progressId,
-			})
-		}
+		await pc.send({ type: "upload-start", path, size: file.size, totalChunks, progressId })
 		const nonce = generateNonce()
 		const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
 		for (let i = 0; i < totalChunks; i++) {
 			const start = i * CHUNK_SIZE
 			const end = Math.min(start + CHUNK_SIZE, file.size)
 			const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer())
-			for (const [, pc] of this.peers) {
-				await pc.sendUploadChunk(path, i, totalChunks, chunk)
-			}
+			await pc.sendUploadChunk(path, i, totalChunks, chunk)
 			const progress = ((i + 1) / totalChunks) * 100
 			updateProgressItem(progressId, progress, "upload")
 		}
@@ -758,15 +827,7 @@ class FolderShare {
 		const fileData = await file.arrayBuffer()
 		const hmac = await computeHMAC(hmacKey, new Uint8Array(fileData))
 
-		for (const [, pc] of this.peers) {
-			await pc.send({
-				type: "upload-complete",
-				path,
-				nonce,
-				hmac,
-				progressId,
-			})
-		}
+		await pc.send({ type: "upload-complete", path, nonce, hmac, progressId })
 	}
 }
 
