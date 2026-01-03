@@ -9,6 +9,14 @@ export const CHUNK_SIZE = 64 * 1024
 // If a peer connection isn't established within this time, it fails.
 export const WEBRTC_TIMEOUT = 5000
 
+// Grace period in milliseconds before showing "Disconnected" when host leaves (15 seconds).
+// During this period, "Reconnecting" is shown to allow the host to reconnect.
+export const HOST_RECONNECT_GRACE_PERIOD = 15000
+
+// Timeout in milliseconds for relay connection confirmation (10 seconds).
+// If relay is not confirmed within this time, connection is considered failed.
+export const RELAY_CONFIRM_TIMEOUT = 10000
+
 // High-water mark for the WebRTC data channel buffer (4MB).
 // When bufferedAmount exceeds this, sending pauses to prevent memory overflow.
 export const WEBRTC_BUFFER_THRESHOLD = 4 * 1024 * 1024

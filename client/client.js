@@ -33,7 +33,8 @@ import {
 	MAX_FILE_SIZE,
 	UPLOAD_LIMITS,
 	DOWNLOAD_RATE_LIMIT,
-	FILE_LIST_LIMITS
+	FILE_LIST_LIMITS,
+	HOST_RECONNECT_GRACE_PERIOD
 } from "./config.js"
 import {
 	showError,
@@ -69,6 +70,7 @@ class FolderShare {
 		this.uploadRateLimiter = new RateLimiter(UPLOAD_LIMITS.rateLimitPerMinute)
 		this.downloadRateLimiter = new RateLimiter(DOWNLOAD_RATE_LIMIT)
 		this.pendingUploads = new Map()
+		this.hostReconnectTimer = null
 		this.init()
 	}
 
@@ -303,11 +305,8 @@ class FolderShare {
 		return this.peers.get(this.hostPeerId) || null
 	}
 
-	_handleHostDisconnected() {
-		this.hostPeerId = null
-		updateConnectionStatus("disconnected")
-
-		// Cancel any in-flight downloads so they don't hang indefinitely.
+	_cancelInFlightTransfers() {
+		// Cancel any in-flight downloads so they don't hang indefinitely
 		for (const [, download] of this.pendingDownloads) {
 			try {
 				removeProgressItem(download.progressId, "download")
@@ -329,14 +328,57 @@ class FolderShare {
 		this.pendingUploadProgress.clear()
 	}
 
+	_startHostReconnectGracePeriod() {
+		// Clear any existing timer
+		if (this.hostReconnectTimer) {
+			clearTimeout(this.hostReconnectTimer)
+		}
+
+		// Show reconnecting state during grace period
+		updateConnectionStatus("reconnecting")
+
+		// Set timer to show disconnected after grace period
+		this.hostReconnectTimer = setTimeout(() => {
+			this.hostReconnectTimer = null
+			// Only show disconnected if host hasn't reconnected
+			if (!this.hostPeerId) {
+				this._handleHostDisconnected()
+			}
+		}, HOST_RECONNECT_GRACE_PERIOD)
+	}
+
+	_handleHostDisconnected() {
+		// Clear grace period timer if active
+		if (this.hostReconnectTimer) {
+			clearTimeout(this.hostReconnectTimer)
+			this.hostReconnectTimer = null
+		}
+
+		this.hostPeerId = null
+		updateConnectionStatus("disconnected")
+
+		this._cancelInFlightTransfers()
+	}
+
 	_handleSignalingReconnected() {
 		// Peer reconnected to signaling server with potentially new peer ID
 		// Host may also have reconnected with a new ID, so clean up old state
+
+		// Clear grace period timer if active
+		if (this.hostReconnectTimer) {
+			clearTimeout(this.hostReconnectTimer)
+			this.hostReconnectTimer = null
+		}
+
 		this.hostPeerId = null
 		for (const [, pc] of this.peers) {
 			pc.close()
 		}
 		this.peers.clear()
+
+		// Cancel in-flight transfers since connections are being reset
+		this._cancelInFlightTransfers()
+
 		updateConnectionStatus("reconnecting")
 	}
 
@@ -381,8 +423,12 @@ class FolderShare {
 				}
 				updatePeerCount(this.peers.size)
 				if (wasHost) {
-					this._handleHostDisconnected()
-				} else if (!this.isHost && this.peers.size === 0) {
+					// Start grace period to allow host to reconnect
+					// Clear hostPeerId so we can detect when a new peer is the host
+					this.hostPeerId = null
+					this._startHostReconnectGracePeriod()
+				} else if (!this.isHost && this.peers.size === 0 && !this.hostReconnectTimer) {
+					// Only show disconnected if we're not in grace period
 					updateConnectionStatus("disconnected")
 				}
 				break
@@ -429,6 +475,14 @@ class FolderShare {
 	}
 
 	async handlePeerMessage(peerId, msg) {
+		// Confirm relay is working on any message from host (not just file-list)
+		if (!this.isHost && this.hostPeerId === peerId) {
+			const hostPc = this.peers.get(this.hostPeerId)
+			if (hostPc && hostPc.useRelay && !hostPc.connected) {
+				hostPc.confirmRelayConnected()
+			}
+		}
+
 		switch (msg.type) {
 			case "file-list":
 				// Host never accepts file lists: peers treat the sender as the host
@@ -441,6 +495,12 @@ class FolderShare {
 				if (msg.files.length > FILE_LIST_LIMITS.maxFiles) {
 					showError(`File list too large (${msg.files.length} files, max ${FILE_LIST_LIMITS.maxFiles})`)
 					return
+				}
+
+				// Cancel grace period timer - host has reconnected successfully
+				if (this.hostReconnectTimer) {
+					clearTimeout(this.hostReconnectTimer)
+					this.hostReconnectTimer = null
 				}
 
 				// Handle host reconnection: if we get a file-list from a different peer,

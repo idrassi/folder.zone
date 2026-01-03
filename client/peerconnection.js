@@ -11,7 +11,8 @@ import {
 	WEBRTC_BUFFER_THRESHOLD,
 	WEBRTC_BUFFER_LOW,
 	MSG_TYPE,
-	MAX_JSON_SIZE
+	MAX_JSON_SIZE,
+	RELAY_CONFIRM_TIMEOUT
 } from "./config.js"
 
 export class PeerConnection {
@@ -31,6 +32,7 @@ export class PeerConnection {
 		this.nextJsonMessageId = 0
 		this.messageQueue = []
 		this.processingMessage = false
+		this.relayConfirmTimer = null
 		this.pc = new RTCPeerConnection({
 			iceServers: ICE_SERVERS,
 			iceCandidatePoolSize: ICE_SERVERS.length
@@ -91,10 +93,22 @@ export class PeerConnection {
 
 		// Show reconnecting state until we confirm relay works
 		this.onStateChange("reconnecting")
+
+		// Set timeout for relay confirmation - if not confirmed, connection is likely dead
+		this.relayConfirmTimer = setTimeout(() => {
+			if (this.useRelay && !this.connected) {
+				this.onStateChange("disconnected")
+			}
+		}, RELAY_CONFIRM_TIMEOUT)
 	}
 
 	confirmRelayConnected() {
 		if (this.useRelay && !this.connected) {
+			// Clear relay confirmation timeout
+			if (this.relayConfirmTimer) {
+				clearTimeout(this.relayConfirmTimer)
+				this.relayConfirmTimer = null
+			}
 			this.connected = true
 			this.onStateChange("connected (relay)")
 		}
@@ -357,6 +371,10 @@ export class PeerConnection {
 
 	close() {
 		clearTimeout(this.fallbackTimer)
+		if (this.relayConfirmTimer) {
+			clearTimeout(this.relayConfirmTimer)
+			this.relayConfirmTimer = null
+		}
 		for (const [, buffer] of this.jsonChunkBuffers) {
 			if (buffer.timeout) clearTimeout(buffer.timeout)
 		}
