@@ -53,8 +53,12 @@ export class PeerConnection {
 			if (state === "connected") {
 				this.connected = true
 				clearTimeout(this.fallbackTimer)
-			} else if (state === "failed" || state === "disconnected") {
+				onStateChange(state)
+				return
+			}
+			if (state === "failed" || state === "disconnected") {
 				this.switchToRelay()
+				return
 			}
 			onStateChange(state)
 		}
@@ -79,6 +83,7 @@ export class PeerConnection {
 	switchToRelay() {
 		if (this.useRelay) return
 		this.useRelay = true
+		this.connected = false
 		// Don't set connected = true yet - wait for confirmation via successful message exchange
 
 		// Drain queued messages through relay
