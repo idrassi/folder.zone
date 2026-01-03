@@ -19,9 +19,14 @@ export const SIGNALING_PING_INTERVAL = 10000
 // Time since last signaling activity before forcing reconnect (milliseconds).
 export const SIGNALING_PONG_TIMEOUT = 30000
 
-// Timeout in milliseconds for relay connection confirmation (10 seconds).
-// If relay is not confirmed within this time, connection is considered failed.
-export const RELAY_CONFIRM_TIMEOUT = 10000
+// Base delay in milliseconds for relay hello retries.
+export const RELAY_HELLO_RETRY_BASE_DELAY = 1000
+
+// Maximum delay in milliseconds between relay hello retries.
+export const RELAY_HELLO_RETRY_MAX_DELAY = 4000
+
+// Maximum number of relay hello retries before forcing a signaling reconnect.
+export const RELAY_HELLO_MAX_RETRIES = 5
 
 // Timeout in milliseconds before failing a stalled transfer (20 seconds).
 export const TRANSFER_PROGRESS_TIMEOUT = 20000

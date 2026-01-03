@@ -116,6 +116,24 @@ export class Signaling {
 		}, delay)
 	}
 
+	forceReconnect() {
+		if (this.intentionallyClosed) return
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer)
+			this.reconnectTimer = null
+		}
+		this.reconnectAttempt = 0
+		if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+			this._stopHeartbeat()
+			this.connected = false
+			this.onConnectionChange("disconnected")
+			this._scheduleReconnect()
+			return
+		}
+		if (this.ws.readyState === WebSocket.CLOSING) return
+		this.ws.close()
+	}
+
 	_startHeartbeat() {
 		this._stopHeartbeat()
 		this.pingTimer = setInterval(() => {

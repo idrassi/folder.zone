@@ -12,16 +12,19 @@ import {
 	WEBRTC_BUFFER_LOW,
 	MSG_TYPE,
 	MAX_JSON_SIZE,
-	RELAY_CONFIRM_TIMEOUT
+	RELAY_HELLO_RETRY_BASE_DELAY,
+	RELAY_HELLO_RETRY_MAX_DELAY,
+	RELAY_HELLO_MAX_RETRIES
 } from "./config.js"
 
 export class PeerConnection {
-	constructor(peerId, signaling, cryptoKey, isInitiator, onMessage, onStateChange) {
+	constructor(peerId, signaling, cryptoKey, isInitiator, onMessage, onStateChange, onForceReconnect) {
 		this.peerId = peerId
 		this.signaling = signaling
 		this.cryptoKey = cryptoKey
 		this.onMessage = onMessage
 		this.onStateChange = onStateChange
+		this.onForceReconnect = onForceReconnect || (() => {})
 		this.channel = null
 		this.useRelay = false
 		this.connected = false
@@ -32,7 +35,10 @@ export class PeerConnection {
 		this.nextJsonMessageId = 0
 		this.messageQueue = []
 		this.processingMessage = false
-		this.relayConfirmTimer = null
+		this.relayHelloTimer = null
+		this.relayHelloAttempts = 0
+		this.relayHelloInFlight = false
+		this.relayReconnectForced = false
 		this.pc = new RTCPeerConnection({
 			iceServers: ICE_SERVERS,
 			iceCandidatePoolSize: ICE_SERVERS.length
@@ -92,9 +98,7 @@ export class PeerConnection {
 		// Show reconnecting state until we confirm relay works
 		this.onStateChange("reconnecting")
 
-		// Set timeout for relay confirmation - if not confirmed, connection is likely dead
-		this._startRelayConfirmTimer()
-		void this.sendHello()
+		this._startRelayHelloRetries(true)
 	}
 
 	async _flushRelayQueue() {
@@ -111,24 +115,78 @@ export class PeerConnection {
 		}
 	}
 
-	_startRelayConfirmTimer() {
-		if (this.relayConfirmTimer) {
-			clearTimeout(this.relayConfirmTimer)
+	_startRelayHelloRetries(resetAttempts) {
+		if (!this.useRelay || this.connected || this.relayReconnectForced) return
+		if (resetAttempts) {
+			this.relayHelloAttempts = 0
+			this.relayReconnectForced = false
 		}
-		this.relayConfirmTimer = setTimeout(() => {
-			if (this.useRelay && !this.connected) {
-				this.onStateChange("disconnected")
-			}
-		}, RELAY_CONFIRM_TIMEOUT)
+		if (this.relayHelloTimer) return
+		this._scheduleRelayHello(0)
+	}
+
+	_scheduleRelayHello(delay) {
+		this.relayHelloTimer = setTimeout(() => {
+			this.relayHelloTimer = null
+			void this._attemptRelayHello()
+		}, delay)
+	}
+
+	async _attemptRelayHello() {
+		if (!this.useRelay || this.connected || this.relayReconnectForced) {
+			this._stopRelayHelloRetries(false)
+			return
+		}
+		this.relayHelloAttempts++
+		this.relayHelloInFlight = true
+		await this.sendHello()
+		this.relayHelloInFlight = false
+
+		if (this.connected || !this.useRelay || this.relayReconnectForced) {
+			this._stopRelayHelloRetries(false)
+			return
+		}
+		if (this.relayHelloAttempts >= RELAY_HELLO_MAX_RETRIES) {
+			this._handleRelayMaxRetries()
+			return
+		}
+		const delay = this._getRelayHelloDelay(this.relayHelloAttempts)
+		this._scheduleRelayHello(delay)
+	}
+
+	_stopRelayHelloRetries(resetState) {
+		if (this.relayHelloTimer) {
+			clearTimeout(this.relayHelloTimer)
+			this.relayHelloTimer = null
+		}
+		this.relayHelloInFlight = false
+		if (resetState) {
+			this.relayHelloAttempts = 0
+			this.relayReconnectForced = false
+		}
+	}
+
+	_getRelayHelloDelay(attempt) {
+		const expDelay = Math.min(
+			RELAY_HELLO_RETRY_BASE_DELAY * 2 ** Math.max(0, attempt - 1),
+			RELAY_HELLO_RETRY_MAX_DELAY,
+		)
+		const jitter = Math.floor(expDelay * 0.2 * Math.random())
+		return expDelay + jitter
+	}
+
+	_handleRelayMaxRetries() {
+		this._stopRelayHelloRetries(false)
+		if (!this.relayReconnectForced) {
+			this.relayReconnectForced = true
+			this.onForceReconnect()
+		}
+		this.onStateChange("disconnected")
 	}
 
 	confirmRelayConnected() {
 		if (this.useRelay && !this.connected) {
-			// Clear relay confirmation timeout
-			if (this.relayConfirmTimer) {
-				clearTimeout(this.relayConfirmTimer)
-				this.relayConfirmTimer = null
-			}
+			this._stopRelayHelloRetries(true)
 			this.connected = true
 			this.onStateChange("connected (relay)")
 		}
@@ -138,7 +196,8 @@ export class PeerConnection {
 		if (!this.useRelay) return
 		this.connected = false
 		this.onStateChange("reconnecting")
-		this._startRelayConfirmTimer()
+		if (this.relayHelloInFlight) return
+		this._startRelayHelloRetries(false)
 	}
 
 	async sendHello() {
@@ -419,10 +478,7 @@ export class PeerConnection {
 
 	close() {
 		clearTimeout(this.fallbackTimer)
-		if (this.relayConfirmTimer) {
-			clearTimeout(this.relayConfirmTimer)
-			this.relayConfirmTimer = null
-		}
+		this._stopRelayHelloRetries(true)
 		for (const [, buffer] of this.jsonChunkBuffers) {
 			if (buffer.timeout) clearTimeout(buffer.timeout)
 		}

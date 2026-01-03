@@ -485,6 +485,13 @@ class FolderShare {
 		}
 	}
 
+	_forceSignalingReconnect(peerId) {
+		if (this.isHost || !this.signaling || !this.roomId) return
+		if (this.hostPeerId && peerId && peerId !== this.hostPeerId) return
+		if (!this.hostPeerId && this.peers.size > 1) return
+		this.signaling.forceReconnect()
+	}
+
 	_handleHostSignalingReconnected() {
 		// Host reconnected to signaling server with new peer ID
 		// Clean up all old peer connections - peers will rejoin
@@ -537,6 +544,7 @@ class FolderShare {
 					isHost,
 					(m) => this.handlePeerMessage(msg.peerId, m),
 					(state) => this.handleConnectionState(msg.peerId, state),
+					this.isHost ? null : () => this._forceSignalingReconnect(msg.peerId),
 				)
 				this.peers.set(msg.peerId, pc)
 				if (clientId) {
