@@ -318,6 +318,21 @@ class FolderShare {
 		return pc
 	}
 
+	_getConnectedPeerCount() {
+		let count = 0
+		for (const [, pc] of this.peers) {
+			if (pc.isReady()) {
+				count++
+			}
+		}
+		return count
+	}
+
+	_updatePeerCount() {
+		if (!this.isHost) return
+		updatePeerCount(this._getConnectedPeerCount())
+	}
+
 	_cancelInFlightTransfers() {
 		// Cancel any in-flight downloads so they don't hang indefinitely
 		for (const [, download] of this.pendingDownloads) {
@@ -443,7 +458,7 @@ class FolderShare {
 		// Cancel in-flight transfers since connections are being reset
 		this._cancelInFlightTransfers()
 
-		updateConnectionStatus("reconnecting")
+		this._startHostReconnectGracePeriod()
 	}
 
 	_handleSignalingConnectionChange(state) {
@@ -462,8 +477,11 @@ class FolderShare {
 			return
 		}
 
+		if (hostPc && hostPc.useRelay && !hostPc.connected) {
+			void hostPc.sendHello()
+		}
 		if (!this.hostPeerId) {
-			updateConnectionStatus("reconnecting")
+			this._startHostReconnectGracePeriod()
 		}
 	}
 
@@ -476,7 +494,7 @@ class FolderShare {
 		this.peers.clear()
 		this.peerClientIds.clear()
 		this.clientIdToPeerId.clear()
-		updatePeerCount(0)
+		this._updatePeerCount()
 	}
 
 	handleSignalingMessage(msg, isHost) {
@@ -525,7 +543,7 @@ class FolderShare {
 					this.peerClientIds.set(msg.peerId, clientId)
 					this.clientIdToPeerId.set(clientId, msg.peerId)
 				}
-				updatePeerCount(this.peers.size)
+				this._updatePeerCount()
 				break
 			}
 			case "peer-left": {
@@ -540,7 +558,7 @@ class FolderShare {
 					this.peerClientIds.delete(msg.peerId)
 					this.clientIdToPeerId.delete(clientId)
 				}
-				updatePeerCount(this.peers.size)
+				this._updatePeerCount()
 				if (wasHost) {
 					// Start grace period to allow host to reconnect
 					// Clear hostPeerId so we can detect when a new peer is the host
@@ -583,13 +601,19 @@ class FolderShare {
 				} else if (state === "disconnected" || state === "failed") {
 					updateConnectionStatus("disconnected")
 				}
-			} else if (!this.hostPeerId && this.peers.size === 1 && isReconnecting) {
-				// Only one peer and no host set yet - show reconnecting
-				updateConnectionStatus("reconnecting")
+			} else if (!this.hostPeerId) {
+				if (isConnected || isReconnecting) {
+					updateConnectionStatus("reconnecting")
+				} else if ((state === "disconnected" || state === "failed") && !this.hostReconnectTimer && this.signalingConnected) {
+					updateConnectionStatus("disconnected")
+				}
 			}
 		}
-		if (isConnected && this.isHost) {
-			setTimeout(() => this.sendFileList(peerId), 500)
+		if (this.isHost) {
+			if (isConnected) {
+				setTimeout(() => this.sendFileList(peerId), 500)
+			}
+			this._updatePeerCount()
 		}
 	}
 
@@ -601,6 +625,17 @@ class FolderShare {
 		}
 
 		switch (msg.type) {
+			case "hello": {
+				const pc = this.peers.get(peerId)
+				if (pc) {
+					void pc.send({
+						type: "hello-ack"
+					})
+				}
+				break
+			}
+			case "hello-ack":
+				break
 			case "file-list":
 				// Host never accepts file lists: peers treat the sender as the host
 				if (this.isHost) return

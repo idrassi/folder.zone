@@ -94,6 +94,7 @@ export class PeerConnection {
 
 		// Set timeout for relay confirmation - if not confirmed, connection is likely dead
 		this._startRelayConfirmTimer()
+		void this.sendHello()
 	}
 
 	async _flushRelayQueue() {
@@ -138,6 +139,14 @@ export class PeerConnection {
 		this.connected = false
 		this.onStateChange("reconnecting")
 		this._startRelayConfirmTimer()
+	}
+
+	async sendHello() {
+		try {
+			await this.send({
+				type: "hello"
+			})
+		} catch {}
 	}
 
 	isReady() {
