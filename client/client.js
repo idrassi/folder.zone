@@ -116,6 +116,7 @@ class FolderShare {
 			(msg) => this.handleSignalingMessage(msg, false),
 			(error) => showError(error),
 			(fromPeerId, data) => this.handleBinaryRelay(fromPeerId, data),
+			() => this._handleSignalingReconnected(),
 		)
 		this.signaling.connect(this.roomId)
 	}
@@ -212,6 +213,7 @@ class FolderShare {
 			(msg) => this.handleSignalingMessage(msg, true),
 			(error) => showError(error),
 			(fromPeerId, data) => this.handleBinaryRelay(fromPeerId, data),
+			() => this._handleHostSignalingReconnected(),
 		)
 		this.signaling.connect(this.roomId)
 		await this.updateFileList()
@@ -327,9 +329,37 @@ class FolderShare {
 		this.pendingUploadProgress.clear()
 	}
 
+	_handleSignalingReconnected() {
+		// Peer reconnected to signaling server with potentially new peer ID
+		// Host may also have reconnected with a new ID, so clean up old state
+		this.hostPeerId = null
+		for (const [, pc] of this.peers) {
+			pc.close()
+		}
+		this.peers.clear()
+		updateConnectionStatus("reconnecting")
+	}
+
+	_handleHostSignalingReconnected() {
+		// Host reconnected to signaling server with new peer ID
+		// Clean up all old peer connections - peers will rejoin
+		for (const [, pc] of this.peers) {
+			pc.close()
+		}
+		this.peers.clear()
+		updatePeerCount(0)
+	}
+
 	handleSignalingMessage(msg, isHost) {
 		switch (msg.type) {
 			case "peer-joined": {
+				// Clean up any existing stale connection for this peer ID
+				const existingPc = this.peers.get(msg.peerId)
+				if (existingPc) {
+					existingPc.close()
+					this.peers.delete(msg.peerId)
+				}
+
 				const pc = new PeerConnection(
 					msg.peerId,
 					this.signaling,
@@ -376,10 +406,22 @@ class FolderShare {
 
 	handleConnectionState(peerId, state) {
 		const isConnected = state === "connected" || state === "connected (relay)"
+		const isReconnecting = state === "reconnecting" || state === "connecting (relay)"
 
-		// Peer UI should reflect the host connection only
-		if (!this.isHost && isConnected && this.hostPeerId && peerId === this.hostPeerId) {
-			updateConnectionStatus(state, state === "connected (relay)")
+		if (!this.isHost) {
+			// Peer UI should reflect the host connection status
+			if (this.hostPeerId && peerId === this.hostPeerId) {
+				if (isConnected) {
+					updateConnectionStatus(state, state === "connected (relay)")
+				} else if (isReconnecting) {
+					updateConnectionStatus("reconnecting")
+				} else if (state === "disconnected" || state === "failed") {
+					updateConnectionStatus("disconnected")
+				}
+			} else if (!this.hostPeerId && this.peers.size === 1 && isReconnecting) {
+				// Only one peer and no host set yet - show reconnecting
+				updateConnectionStatus("reconnecting")
+			}
 		}
 		if (isConnected && this.isHost) {
 			setTimeout(() => this.sendFileList(peerId), 500)
@@ -401,18 +443,32 @@ class FolderShare {
 					return
 				}
 
-				// First file-list sender is authoritative host for this peer session
-				if (!this.hostPeerId) {
-					this.hostPeerId = peerId
-
-					// If the host connection is already established, reflect it in UI
-					const hostPc = this.peers.get(this.hostPeerId)
-					if (hostPc && hostPc.connected) {
-						updateConnectionStatus(hostPc.useRelay ? "connected (relay)" : "connected", !!hostPc.useRelay)
+				// Handle host reconnection: if we get a file-list from a different peer,
+				// that's the new host (old host reconnected with new peer ID)
+				if (this.hostPeerId && peerId !== this.hostPeerId) {
+					// Clean up old host connection
+					const oldPc = this.peers.get(this.hostPeerId)
+					if (oldPc) {
+						oldPc.close()
+						this.peers.delete(this.hostPeerId)
 					}
-				} else if (peerId !== this.hostPeerId) {
-					// Ignore non-host file lists
-					return
+				}
+
+				// Set/update the host peer ID
+				this.hostPeerId = peerId
+
+				// Confirm connection is working (especially important for relay mode)
+				const hostPc = this.peers.get(this.hostPeerId)
+				if (hostPc) {
+					// If using relay and not yet confirmed connected, confirm it now
+					if (hostPc.useRelay && !hostPc.connected) {
+						hostPc.confirmRelayConnected()
+					}
+					// Update UI to reflect actual connection status
+					updateConnectionStatus(
+						hostPc.useRelay ? "connected (relay)" : "connected",
+						hostPc.useRelay
+					)
 				}
 
 				this.files = msg.files

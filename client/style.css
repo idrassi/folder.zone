@@ -201,6 +201,11 @@ body {
 	box-shadow: 0 0 8px var(--error);
 }
 
+.status-dot.reconnecting {
+	background: var(--warning);
+	animation: pulse 1.5s infinite;
+}
+
 @keyframes pulse {
 
 	0%,

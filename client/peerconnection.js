@@ -77,8 +77,9 @@ export class PeerConnection {
 	switchToRelay() {
 		if (this.useRelay) return
 		this.useRelay = true
-		this.connected = true
+		// Don't set connected = true yet - wait for confirmation via successful message exchange
 
+		// Drain queued messages through relay
 		while (this.sendQueue.length > 0) {
 			const {
 				data,
@@ -88,7 +89,15 @@ export class PeerConnection {
 			resolve()
 		}
 
-		this.onStateChange("connected (relay)")
+		// Show reconnecting state until we confirm relay works
+		this.onStateChange("reconnecting")
+	}
+
+	confirmRelayConnected() {
+		if (this.useRelay && !this.connected) {
+			this.connected = true
+			this.onStateChange("connected (relay)")
+		}
 	}
 
 	setupChannel() {

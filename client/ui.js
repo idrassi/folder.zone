@@ -254,19 +254,37 @@ export function updateConnectionStatus(status, isRelay) {
 	const statusText = document.getElementById("peer-status-text")
 	const connectionMode = document.getElementById("connection-mode")
 	const isDisconnected = status === "disconnected"
+	const isReconnecting = status === "reconnecting" || status === "connecting (relay)"
+	const isConnected = status === "connected" || status === "connected (relay)"
 	if (statusEl) {
-		statusEl.textContent = isDisconnected ? "Disconnected" : "Connected"
+		if (isDisconnected) {
+			statusEl.textContent = "Disconnected"
+		} else if (isReconnecting) {
+			statusEl.textContent = "Reconnecting..."
+		} else {
+			statusEl.textContent = "Connected"
+		}
 	}
 	if (statusDot) {
-		statusDot.className = isDisconnected ? "status-dot disconnected" : "status-dot connected"
+		if (isDisconnected) {
+			statusDot.className = "status-dot disconnected"
+		} else if (isReconnecting) {
+			statusDot.className = "status-dot reconnecting"
+		} else {
+			statusDot.className = "status-dot connected"
+		}
 	}
 	if (statusText) {
-		statusText.textContent = isDisconnected ?
-			"Host disconnected" :
-			isRelay ? "Connected via relay" : "Connected directly"
+		if (isDisconnected) {
+			statusText.textContent = "Host disconnected"
+		} else if (isReconnecting) {
+			statusText.textContent = "Attempting to reconnect..."
+		} else {
+			statusText.textContent = isRelay ? "Connected via relay" : "Connected directly"
+		}
 	}
 	if (connectionMode) {
-		if (isDisconnected) {
+		if (isDisconnected || isReconnecting) {
 			connectionMode.hidden = true
 		} else {
 			connectionMode.hidden = false
