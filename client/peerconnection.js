@@ -163,6 +163,9 @@ export class PeerConnection {
 		this.channel.onopen = () => {
 			this.connected = true
 			clearTimeout(this.fallbackTimer)
+			if (!this.useRelay) {
+				this.onStateChange("connected")
+			}
 		}
 		this.channel.onclose = () => {
 			this.switchToRelay()
