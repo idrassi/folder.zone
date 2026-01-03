@@ -29,6 +29,12 @@ export const REDIS_URL = process.env.REDIS_URL
 // Upstash Redis REST API authentication token.
 export const REDIS_TOKEN = process.env.REDIS_TOKEN
 
+// Close signaling connections that haven't been seen within this time (milliseconds).
+export const SIGNALING_STALE_TIMEOUT = 30000
+
+// Interval for checking and closing stale signaling connections (milliseconds).
+export const SIGNALING_STALE_CHECK_INTERVAL = 10000
+
 // Content-Type mappings for static file serving.
 export const MIME_TYPES = {
 	".html": "text/html",
@@ -56,6 +62,8 @@ export const LIMITS = {
 	roomIdMaxLength: 32,
 	// Allowed characters in room IDs (alphanumeric, underscore, hyphen).
 	roomIdPattern: /^[a-zA-Z0-9_-]+$/,
+	// Maximum length of a client ID string.
+	clientIdMaxLength: 64,
 	// Maximum WebSocket messages per peer per minute.
 	messagesPerMinute: 100000000,
 	// Maximum relay bytes per peer per minute (5GB).

@@ -87,19 +87,33 @@ export class PeerConnection {
 		// Don't set connected = true yet - wait for confirmation via successful message exchange
 
 		// Drain queued messages through relay
-		while (this.sendQueue.length > 0) {
-			const {
-				data,
-				resolve
-			} = this.sendQueue.shift()
-			this.signaling.sendBinaryRelay(this.peerId, data)
-			resolve()
-		}
+		void this._flushRelayQueue()
 
 		// Show reconnecting state until we confirm relay works
 		this.onStateChange("reconnecting")
 
 		// Set timeout for relay confirmation - if not confirmed, connection is likely dead
+		this._startRelayConfirmTimer()
+	}
+
+	async _flushRelayQueue() {
+		while (this.sendQueue.length > 0) {
+			const {
+				data,
+				resolve
+			} = this.sendQueue.shift()
+			const sent = await this.signaling.sendBinaryRelay(this.peerId, data)
+			if (!sent) {
+				this.markRelayDisconnected()
+			}
+			resolve()
+		}
+	}
+
+	_startRelayConfirmTimer() {
+		if (this.relayConfirmTimer) {
+			clearTimeout(this.relayConfirmTimer)
+		}
 		this.relayConfirmTimer = setTimeout(() => {
 			if (this.useRelay && !this.connected) {
 				this.onStateChange("disconnected")
@@ -117,6 +131,20 @@ export class PeerConnection {
 			this.connected = true
 			this.onStateChange("connected (relay)")
 		}
+	}
+
+	markRelayDisconnected() {
+		if (!this.useRelay) return
+		this.connected = false
+		this.onStateChange("reconnecting")
+		this._startRelayConfirmTimer()
+	}
+
+	isReady() {
+		if (this.useRelay) {
+			return this.connected && this.signaling.isConnected()
+		}
+		return this.connected && this.channel && this.channel.readyState === "open"
 	}
 
 	setupChannel() {
@@ -371,7 +399,10 @@ export class PeerConnection {
 				return
 			}
 		}
-		await this.signaling.sendBinaryRelay(this.peerId, encrypted)
+		const sent = await this.signaling.sendBinaryRelay(this.peerId, encrypted)
+		if (!sent) {
+			this.markRelayDisconnected()
+		}
 	}
 
 	close() {

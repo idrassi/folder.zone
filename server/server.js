@@ -4,14 +4,17 @@
 import {
 	PORT,
 	MACHINE_ID,
-	REDIS_URL
+	REDIS_URL,
+	SIGNALING_STALE_TIMEOUT,
+	SIGNALING_STALE_CHECK_INTERVAL
 } from "./config.js"
 import {
 	getRoomOwner,
 	startRoomRefreshInterval
 } from "./redis.js"
 import {
-	rooms
+	rooms,
+	pruneStalePeers
 } from "./rooms.js"
 import {
 	websocketHandler
@@ -61,5 +64,8 @@ Bun.serve({
 })
 
 startRoomRefreshInterval(rooms)
+setInterval(() => {
+	void pruneStalePeers(SIGNALING_STALE_TIMEOUT)
+}, SIGNALING_STALE_CHECK_INTERVAL)
 
 console.log(`Server running on port ${PORT} (machine: ${MACHINE_ID})`)

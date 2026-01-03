@@ -61,6 +61,12 @@ function isValidRoomId(roomId) {
 	return LIMITS.roomIdPattern.test(roomId)
 }
 
+function sanitizeClientId(clientId) {
+	if (typeof clientId !== "string") return null
+	if (!clientId || clientId.length > LIMITS.clientIdMaxLength) return null
+	return clientId
+}
+
 function generatePeerId() {
 	return randomBytes(16).toString("base64url")
 }
@@ -68,6 +74,9 @@ function generatePeerId() {
 export const websocketHandler = {
 	async message(ws, data) {
 		try {
+			if (ws.data) {
+				ws.data.lastSeen = Date.now()
+			}
 			if (data instanceof Buffer || data instanceof Uint8Array) {
 				const bytes = new Uint8Array(data)
 				if (bytes.length > LIMITS.maxRelayMessageSize) {
@@ -96,6 +105,12 @@ export const websocketHandler = {
 			}
 			const msg = JSON.parse(data)
 			switch (msg.type) {
+				case "ping": {
+					ws.send(JSON.stringify({
+						type: "pong"
+					}))
+					break
+				}
 				case "join": {
 					if (!isValidRoomId(msg.room)) {
 						ws.send(JSON.stringify({
@@ -122,14 +137,16 @@ export const websocketHandler = {
 						ws.close()
 						return
 					}
+					const clientId = sanitizeClientId(msg.clientId)
 					const peerId = generatePeerId()
-					const result = await joinRoom(msg.room, peerId, ws)
+					const result = await joinRoom(msg.room, peerId, ws, clientId)
 					if (!result.success) {
 						ws.close()
 						return
 					}
 					ws.data.room = msg.room
 					ws.data.peerId = peerId
+					ws.data.clientId = clientId
 					ws.send(JSON.stringify({
 						type: "peer-id",
 						peerId

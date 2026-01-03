@@ -2,7 +2,9 @@
 // Copyright 2026 Nadim Kobeissi <nadim@symbolic.software>
 
 import {
-	BINARY_RELAY
+	BINARY_RELAY,
+	SIGNALING_PING_INTERVAL,
+	SIGNALING_PONG_TIMEOUT
 } from "./config.js"
 
 const WS_BUFFER_THRESHOLD = 4 * 1024 * 1024
@@ -10,21 +12,27 @@ const WS_BUFFER_CHECK_INTERVAL = 50
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]
 
 export class Signaling {
-	constructor(onMessage, onError, onBinaryRelay, onReconnect) {
+	constructor(onMessage, onError, onBinaryRelay, onReconnect, onConnectionChange) {
 		this.onMessage = onMessage
 		this.onError = onError || (() => {})
 		this.onBinaryRelay = onBinaryRelay || (() => {})
 		this.onReconnect = onReconnect || (() => {})
+		this.onConnectionChange = onConnectionChange || (() => {})
 		this.ws = null
 		this.peerId = null
 		this.room = null
+		this.clientId = null
 		this.reconnectAttempt = 0
 		this.reconnectTimer = null
+		this.pingTimer = null
+		this.lastPongAt = 0
+		this.connected = false
 		this.intentionallyClosed = false
 	}
 
-	connect(room) {
+	connect(room, clientId) {
 		this.room = room
+		this.clientId = clientId || null
 		this.intentionallyClosed = false
 		this._connect()
 	}
@@ -35,14 +43,20 @@ export class Signaling {
 		this.ws.binaryType = "arraybuffer"
 
 		this.ws.onopen = () => {
+			this.connected = true
 			this.reconnectAttempt = 0
+			this.lastPongAt = Date.now()
+			this._startHeartbeat()
+			this.onConnectionChange("connected")
 			this.ws.send(JSON.stringify({
 				type: "join",
-				room: this.room
+				room: this.room,
+				clientId: this.clientId
 			}))
 		}
 
 		this.ws.onmessage = (event) => {
+			this.lastPongAt = Date.now()
 			if (event.data instanceof ArrayBuffer) {
 				const bytes = new Uint8Array(event.data)
 				if (bytes[0] === BINARY_RELAY) {
@@ -55,6 +69,10 @@ export class Signaling {
 			}
 
 			const msg = JSON.parse(event.data)
+
+			if (msg.type === "pong") {
+				return
+			}
 
 			if (msg.type === "peer-id") {
 				const isReconnect = this.peerId !== null && this.peerId !== msg.peerId
@@ -75,6 +93,9 @@ export class Signaling {
 
 		this.ws.onclose = () => {
 			if (this.intentionallyClosed) return
+			this._stopHeartbeat()
+			this.connected = false
+			this.onConnectionChange("disconnected")
 			this._scheduleReconnect()
 		}
 
@@ -95,21 +116,53 @@ export class Signaling {
 		}, delay)
 	}
 
+	_startHeartbeat() {
+		this._stopHeartbeat()
+		this.pingTimer = setInterval(() => {
+			this._sendPing()
+		}, SIGNALING_PING_INTERVAL)
+	}
+
+	_stopHeartbeat() {
+		if (this.pingTimer) {
+			clearInterval(this.pingTimer)
+			this.pingTimer = null
+		}
+	}
+
+	_sendPing() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+		const now = Date.now()
+		if (this.lastPongAt && now - this.lastPongAt > SIGNALING_PONG_TIMEOUT) {
+			this.ws.close()
+			return
+		}
+		this.ws.send(JSON.stringify({
+			type: "ping"
+		}))
+	}
+
+	isConnected() {
+		return !!this.ws && this.ws.readyState === WebSocket.OPEN
+	}
+
 	send(msg) {
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify(msg))
+			return true
 		}
+		return false
 	}
 
 	async sendBinaryRelay(targetPeerId, data) {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			return
+			return false
 		}
 
 		while (this.ws.bufferedAmount > WS_BUFFER_THRESHOLD) {
 			await new Promise((r) => setTimeout(r, WS_BUFFER_CHECK_INTERVAL))
 			if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-				return
+				return false
 			}
 		}
 
@@ -121,6 +174,7 @@ export class Signaling {
 		msg.set(peerIdBytes, 3)
 		msg.set(data, 3 + peerIdBytes.length)
 		this.ws.send(msg)
+		return true
 	}
 
 	close() {
@@ -129,6 +183,9 @@ export class Signaling {
 			clearTimeout(this.reconnectTimer)
 			this.reconnectTimer = null
 		}
+		this._stopHeartbeat()
+		this.connected = false
+		this.onConnectionChange("disconnected")
 		if (this.ws) {
 			this.ws.close()
 			this.ws = null

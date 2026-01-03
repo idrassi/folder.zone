@@ -34,7 +34,9 @@ import {
 	UPLOAD_LIMITS,
 	DOWNLOAD_RATE_LIMIT,
 	FILE_LIST_LIMITS,
-	HOST_RECONNECT_GRACE_PERIOD
+	HOST_RECONNECT_GRACE_PERIOD,
+	TRANSFER_PROGRESS_TIMEOUT,
+	UPLOAD_RESPONSE_TIMEOUT
 } from "./config.js"
 import {
 	showError,
@@ -59,12 +61,17 @@ class FolderShare {
 		this.roomId = null
 		this.cryptoKey = null
 		this.signaling = null
+		this.clientId = getOrCreateClientId()
+		this.signalingConnected = false
 		this.hostPeerId = null
 		this.peers = new Map()
+		this.peerClientIds = new Map()
+		this.clientIdToPeerId = new Map()
 		this.files = []
 		this.allowWrite = false
 		this.pendingDownloads = new Map()
 		this.pendingUploadProgress = new Set()
+		this.pendingUploadTimeouts = new Map()
 		this.currentPath = ""
 		this.folderName = ""
 		this.uploadRateLimiter = new RateLimiter(UPLOAD_LIMITS.rateLimitPerMinute)
@@ -119,8 +126,9 @@ class FolderShare {
 			(error) => showError(error),
 			(fromPeerId, data) => this.handleBinaryRelay(fromPeerId, data),
 			() => this._handleSignalingReconnected(),
+			(state) => this._handleSignalingConnectionChange(state),
 		)
-		this.signaling.connect(this.roomId)
+		this.signaling.connect(this.roomId, this.clientId)
 	}
 
 	setupPeerUpload() {
@@ -216,8 +224,9 @@ class FolderShare {
 			(error) => showError(error),
 			(fromPeerId, data) => this.handleBinaryRelay(fromPeerId, data),
 			() => this._handleHostSignalingReconnected(),
+			(state) => this._handleSignalingConnectionChange(state),
 		)
-		this.signaling.connect(this.roomId)
+		this.signaling.connect(this.roomId, this.clientId)
 		await this.updateFileList()
 		this.watchFolder()
 	}
@@ -300,14 +309,21 @@ class FolderShare {
 		document.getElementById("qr-modal").hidden = true
 	}
 
-	_getHostConnection() {
+	_getHostConnection(requireReady = false) {
 		if (!this.hostPeerId) return null
-		return this.peers.get(this.hostPeerId) || null
+		const pc = this.peers.get(this.hostPeerId) || null
+		if (requireReady && pc && !pc.isReady()) {
+			return null
+		}
+		return pc
 	}
 
 	_cancelInFlightTransfers() {
 		// Cancel any in-flight downloads so they don't hang indefinitely
 		for (const [, download] of this.pendingDownloads) {
+			if (download.timeout) {
+				clearTimeout(download.timeout)
+			}
 			try {
 				removeProgressItem(download.progressId, "download")
 			} catch {}
@@ -321,11 +337,57 @@ class FolderShare {
 
 		// Cancel any in-flight uploads so they don't hang indefinitely
 		for (const progressId of this.pendingUploadProgress) {
+			const timeout = this.pendingUploadTimeouts.get(progressId)
+			if (timeout) {
+				clearTimeout(timeout)
+				this.pendingUploadTimeouts.delete(progressId)
+			}
 			try {
 				removeProgressItem(progressId, "upload")
 			} catch {}
 		}
 		this.pendingUploadProgress.clear()
+		this.pendingUploadTimeouts.clear()
+	}
+
+	_armDownloadTimeout(path) {
+		const download = this.pendingDownloads.get(path)
+		if (!download) return
+		if (download.timeout) {
+			clearTimeout(download.timeout)
+		}
+		download.timeout = setTimeout(() => {
+			this._failDownload(path, "Download stalled")
+		}, TRANSFER_PROGRESS_TIMEOUT)
+	}
+
+	_failDownload(path, message) {
+		const download = this.pendingDownloads.get(path)
+		if (!download) return
+		if (download.timeout) {
+			clearTimeout(download.timeout)
+		}
+		showError(message)
+		removeProgressItem(download.progressId, "download")
+		this.pendingDownloads.delete(path)
+		if (download.onComplete) {
+			download.onComplete()
+		}
+	}
+
+	_armUploadTimeout(progressId, timeoutMs) {
+		const existing = this.pendingUploadTimeouts.get(progressId)
+		if (existing) {
+			clearTimeout(existing)
+		}
+		const timeout = setTimeout(() => {
+			if (!this.pendingUploadProgress.has(progressId)) return
+			this.pendingUploadProgress.delete(progressId)
+			this.pendingUploadTimeouts.delete(progressId)
+			showUploadResponse(false, "Upload stalled")
+			removeProgressItem(progressId, "upload")
+		}, timeoutMs)
+		this.pendingUploadTimeouts.set(progressId, timeout)
 	}
 
 	_startHostReconnectGracePeriod() {
@@ -375,11 +437,34 @@ class FolderShare {
 			pc.close()
 		}
 		this.peers.clear()
+		this.peerClientIds.clear()
+		this.clientIdToPeerId.clear()
 
 		// Cancel in-flight transfers since connections are being reset
 		this._cancelInFlightTransfers()
 
 		updateConnectionStatus("reconnecting")
+	}
+
+	_handleSignalingConnectionChange(state) {
+		this.signalingConnected = state === "connected"
+		if (this.isHost) return
+
+		const hostPc = this._getHostConnection()
+		if (!this.signalingConnected) {
+			if (hostPc && hostPc.useRelay) {
+				hostPc.markRelayDisconnected()
+			}
+			if (!hostPc || hostPc.useRelay || !hostPc.connected) {
+				updateConnectionStatus("reconnecting")
+				this._cancelInFlightTransfers()
+			}
+			return
+		}
+
+		if (!this.hostPeerId) {
+			updateConnectionStatus("reconnecting")
+		}
 	}
 
 	_handleHostSignalingReconnected() {
@@ -389,17 +474,42 @@ class FolderShare {
 			pc.close()
 		}
 		this.peers.clear()
+		this.peerClientIds.clear()
+		this.clientIdToPeerId.clear()
 		updatePeerCount(0)
 	}
 
 	handleSignalingMessage(msg, isHost) {
 		switch (msg.type) {
 			case "peer-joined": {
+				const clientId = typeof msg.clientId === "string" ? msg.clientId : null
+				if (clientId) {
+					const existingPeerId = this.clientIdToPeerId.get(clientId)
+					if (existingPeerId && existingPeerId !== msg.peerId) {
+						const stalePc = this.peers.get(existingPeerId)
+						if (stalePc) {
+							stalePc.close()
+							this.peers.delete(existingPeerId)
+						}
+						this.peerClientIds.delete(existingPeerId)
+						this.clientIdToPeerId.delete(clientId)
+						if (!this.isHost && this.hostPeerId === existingPeerId) {
+							this.hostPeerId = null
+							this._startHostReconnectGracePeriod()
+						}
+					}
+				}
+
 				// Clean up any existing stale connection for this peer ID
 				const existingPc = this.peers.get(msg.peerId)
 				if (existingPc) {
 					existingPc.close()
 					this.peers.delete(msg.peerId)
+					const existingClientId = this.peerClientIds.get(msg.peerId)
+					if (existingClientId) {
+						this.peerClientIds.delete(msg.peerId)
+						this.clientIdToPeerId.delete(existingClientId)
+					}
 				}
 
 				const pc = new PeerConnection(
@@ -411,6 +521,10 @@ class FolderShare {
 					(state) => this.handleConnectionState(msg.peerId, state),
 				)
 				this.peers.set(msg.peerId, pc)
+				if (clientId) {
+					this.peerClientIds.set(msg.peerId, clientId)
+					this.clientIdToPeerId.set(clientId, msg.peerId)
+				}
 				updatePeerCount(this.peers.size)
 				break
 			}
@@ -420,6 +534,11 @@ class FolderShare {
 				if (pc) {
 					pc.close()
 					this.peers.delete(msg.peerId)
+				}
+				const clientId = this.peerClientIds.get(msg.peerId)
+				if (clientId) {
+					this.peerClientIds.delete(msg.peerId)
+					this.clientIdToPeerId.delete(clientId)
 				}
 				updatePeerCount(this.peers.size)
 				if (wasHost) {
@@ -475,12 +594,10 @@ class FolderShare {
 	}
 
 	async handlePeerMessage(peerId, msg) {
-		// Confirm relay is working on any message from host (not just file-list)
-		if (!this.isHost && this.hostPeerId === peerId) {
-			const hostPc = this.peers.get(this.hostPeerId)
-			if (hostPc && hostPc.useRelay && !hostPc.connected) {
-				hostPc.confirmRelayConnected()
-			}
+		// Confirm relay is working on any decrypted message.
+		const activePc = this.peers.get(peerId)
+		if (activePc && activePc.useRelay && !activePc.connected) {
+			activePc.confirmRelayConnected()
 		}
 
 		switch (msg.type) {
@@ -607,9 +724,9 @@ class FolderShare {
 			showError(`File too large (max ${formatSize(MAX_FILE_SIZE)})`)
 			return
 		}
-		const pc = this._getHostConnection()
+		const pc = this._getHostConnection(true)
 		if (!pc) {
-			showError("Host disconnected")
+			showError("Host reconnecting - please try again")
 			return
 		}
 		const fileName = path.split("/").pop()
@@ -622,6 +739,7 @@ class FolderShare {
 			total: 0,
 			progressId,
 		})
+		this._armDownloadTimeout(path)
 	}
 
 	async downloadFolder(folderPath) {
@@ -656,9 +774,9 @@ class FolderShare {
 			if (onComplete) onComplete()
 			return
 		}
-		const pc = this._getHostConnection()
+		const pc = this._getHostConnection(true)
 		if (!pc) {
-			showError("Host disconnected")
+			showError("Host reconnecting - please try again")
 			if (onComplete) onComplete()
 			return
 		}
@@ -673,6 +791,7 @@ class FolderShare {
 			progressId,
 			onComplete,
 		})
+		this._armDownloadTimeout(path)
 	}
 
 	async handleFileRequest(peerId, path) {
@@ -727,6 +846,7 @@ class FolderShare {
 			download.received++
 			const progress = (download.received / download.total) * 100
 			updateProgressItem(download.progressId, progress, "download")
+			this._armDownloadTimeout(msg.path)
 		} else {
 			console.warn(`Received chunk for unknown download: ${msg.path}`)
 		}
@@ -735,6 +855,9 @@ class FolderShare {
 	async handleFileComplete(msg) {
 		const download = this.pendingDownloads.get(msg.path)
 		if (download && download.received === download.total) {
+			if (download.timeout) {
+				clearTimeout(download.timeout)
+			}
 			try {
 				const blob = new Blob(download.chunks)
 				if (msg.nonce && msg.hmac) {
@@ -765,6 +888,9 @@ class FolderShare {
 				if (download.onComplete) download.onComplete()
 			}
 		} else {
+			if (download) {
+				this._armDownloadTimeout(msg.path)
+			}
 			console.warn(`File complete but chunks missing: got ${download?.received}/${download?.total}`)
 		}
 	}
@@ -896,6 +1022,11 @@ class FolderShare {
 	handleUploadResponse(msg) {
 		const progressId = msg.progressId || msg.path.replace(/[^a-zA-Z0-9]/g, "_")
 		this.pendingUploadProgress.delete(progressId)
+		const timeout = this.pendingUploadTimeouts.get(progressId)
+		if (timeout) {
+			clearTimeout(timeout)
+			this.pendingUploadTimeouts.delete(progressId)
+		}
 		if (msg.success) {
 			setProgressVerified(progressId, true, "upload")
 			showUploadResponse(true, msg.message)
@@ -909,9 +1040,9 @@ class FolderShare {
 
 	async uploadFile(file, targetPath = "") {
 		if (!file) return
-		const pc = this._getHostConnection()
+		const pc = this._getHostConnection(true)
 		if (!pc) {
-			showUploadResponse(false, "Host disconnected")
+			showUploadResponse(false, "Host reconnecting")
 			return
 		}
 		const path = targetPath || file.name
@@ -926,6 +1057,7 @@ class FolderShare {
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`
 		createProgressItem(progressId, path.split("/").pop(), file.size, "upload")
 		this.pendingUploadProgress.add(progressId)
+		this._armUploadTimeout(progressId, TRANSFER_PROGRESS_TIMEOUT)
 		const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
 		await pc.send({ type: "upload-start", path, size: file.size, totalChunks, progressId })
 		const nonce = generateNonce()
@@ -937,6 +1069,7 @@ class FolderShare {
 			await pc.sendUploadChunk(path, i, totalChunks, chunk)
 			const progress = ((i + 1) / totalChunks) * 100
 			updateProgressItem(progressId, progress, "upload")
+			this._armUploadTimeout(progressId, TRANSFER_PROGRESS_TIMEOUT)
 		}
 
 		setProgressVerifying(progressId, "upload")
@@ -944,7 +1077,31 @@ class FolderShare {
 		const hmac = await computeHMAC(hmacKey, new Uint8Array(fileData))
 
 		await pc.send({ type: "upload-complete", path, nonce, hmac, progressId })
+		this._armUploadTimeout(progressId, UPLOAD_RESPONSE_TIMEOUT)
 	}
+}
+
+function getOrCreateClientId() {
+	const storageKey = "folderzone_client_id"
+	try {
+		const existing = sessionStorage.getItem(storageKey)
+		if (existing) return existing
+		const created = generateClientId()
+		sessionStorage.setItem(storageKey, created)
+		return created
+	} catch {
+		return generateClientId()
+	}
+}
+
+function generateClientId() {
+	if (crypto?.randomUUID) return crypto.randomUUID()
+	if (crypto?.getRandomValues) {
+		const bytes = new Uint8Array(16)
+		crypto.getRandomValues(bytes)
+		return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+	}
+	return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
 }
 
 new FolderShare()

@@ -13,9 +13,21 @@ export const WEBRTC_TIMEOUT = 5000
 // During this period, "Reconnecting" is shown to allow the host to reconnect.
 export const HOST_RECONNECT_GRACE_PERIOD = 15000
 
+// Interval for signaling heartbeat pings (milliseconds).
+export const SIGNALING_PING_INTERVAL = 10000
+
+// Time since last signaling activity before forcing reconnect (milliseconds).
+export const SIGNALING_PONG_TIMEOUT = 30000
+
 // Timeout in milliseconds for relay connection confirmation (10 seconds).
 // If relay is not confirmed within this time, connection is considered failed.
 export const RELAY_CONFIRM_TIMEOUT = 10000
+
+// Timeout in milliseconds before failing a stalled transfer (20 seconds).
+export const TRANSFER_PROGRESS_TIMEOUT = 20000
+
+// Timeout in milliseconds waiting for upload completion response (2 minutes).
+export const UPLOAD_RESPONSE_TIMEOUT = 120000
 
 // High-water mark for the WebRTC data channel buffer (4MB).
 // When bufferedAmount exceeds this, sending pauses to prevent memory overflow.

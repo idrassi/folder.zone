@@ -12,7 +12,7 @@ import {
 
 export const rooms = new Map()
 
-export async function joinRoom(roomId, peerId, ws) {
+export async function joinRoom(roomId, peerId, ws, clientId) {
 	if (!rooms.has(roomId)) {
 		const claim = await claimRoom(roomId)
 		if (!claim.success) {
@@ -24,17 +24,45 @@ export async function joinRoom(roomId, peerId, ws) {
 		rooms.set(roomId, new Map())
 	}
 	const room = rooms.get(roomId)
+	if (ws.data) {
+		ws.data.clientId = clientId || null
+		ws.data.lastSeen = Date.now()
+	}
+
+	if (clientId) {
+		for (const [existingPeerId, peer] of room) {
+			if (peer?.data?.clientId === clientId) {
+				room.delete(existingPeerId)
+				for (const [, other] of room) {
+					other.send(JSON.stringify({
+						type: "peer-left",
+						peerId: existingPeerId
+					}))
+				}
+				if (peer.data) {
+					peer.data.room = null
+					peer.data.peerId = null
+				}
+				try {
+					peer.close()
+				} catch {}
+				console.log(`[${MACHINE_ID}] Peer ${existingPeerId} replaced by client ${clientId} in room ${roomId}`)
+			}
+		}
+	}
 	for (const [existingPeerId, peer] of room) {
 		peer.send(
 			JSON.stringify({
 				type: "peer-joined",
 				peerId: peerId,
+				clientId: clientId || null,
 			}),
 		)
 		ws.send(
 			JSON.stringify({
 				type: "peer-joined",
 				peerId: existingPeerId,
+				clientId: peer?.data?.clientId || null,
 			}),
 		)
 	}
@@ -61,6 +89,38 @@ export async function leaveRoom(roomId, peerId) {
 	}
 
 	console.log(`[${MACHINE_ID}] Peer ${peerId} left room ${roomId}`)
+}
+
+export async function pruneStalePeers(staleMs) {
+	const now = Date.now()
+	const stalePeers = []
+	for (const [roomId, room] of rooms) {
+		for (const [peerId, ws] of room) {
+			const lastSeen = ws?.data?.lastSeen
+			if (typeof lastSeen === "number" && now - lastSeen > staleMs) {
+				stalePeers.push({
+					roomId,
+					peerId,
+					ws
+				})
+			}
+		}
+	}
+
+	for (const {
+			roomId,
+			peerId,
+			ws
+		} of stalePeers) {
+		await leaveRoom(roomId, peerId)
+		if (ws?.data) {
+			ws.data.room = null
+			ws.data.peerId = null
+		}
+		try {
+			ws.close()
+		} catch {}
+	}
 }
 
 export function forwardSignal(roomId, fromPeerId, targetPeerId, signal) {
