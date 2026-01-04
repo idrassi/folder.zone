@@ -666,6 +666,10 @@ class FolderShare {
 		if (upload.timeout) clearTimeout(upload.timeout)
 		try {
 			const totalSize = upload.chunks.reduce((sum, c) => sum + c.length, 0)
+			if (totalSize !== upload.size || upload.bytesReceived !== upload.size) {
+				this.sendUploadResponse(peerId, msg.path, false, "Upload size mismatch", progressId)
+				return
+			}
 			const combined = new Uint8Array(totalSize)
 			let offset = 0
 			for (const chunk of upload.chunks) {
@@ -731,12 +735,28 @@ class FolderShare {
 		}
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`
 		createProgressItem(progressId, path.split("/").pop(), file.size, "upload")
-		const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
+		let fileData
+		try {
+			fileData = new Uint8Array(await file.arrayBuffer())
+		} catch (e) {
+			console.error("Upload read error:", e)
+			showUploadResponse(false, "Failed to read file")
+			setProgressVerified(progressId, false, "upload")
+			setTimeout(() => removeProgressItem(progressId, "upload"), 3000)
+			return
+		}
+		if (fileData.length !== file.size) {
+			showUploadResponse(false, "Failed to read file")
+			setProgressVerified(progressId, false, "upload")
+			setTimeout(() => removeProgressItem(progressId, "upload"), 3000)
+			return
+		}
+		const totalChunks = Math.max(1, Math.ceil(fileData.length / CHUNK_SIZE))
 		for (const [, pc] of this.peers) {
 			await pc.send({
 				type: "upload-start",
 				path,
-				size: file.size,
+				size: fileData.length,
 				totalChunks,
 				progressId,
 			})
@@ -745,8 +765,8 @@ class FolderShare {
 		const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
 		for (let i = 0; i < totalChunks; i++) {
 			const start = i * CHUNK_SIZE
-			const end = Math.min(start + CHUNK_SIZE, file.size)
-			const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer())
+			const end = Math.min(start + CHUNK_SIZE, fileData.length)
+			const chunk = fileData.subarray(start, end)
 			for (const [, pc] of this.peers) {
 				await pc.sendUploadChunk(path, i, totalChunks, chunk)
 			}
@@ -755,8 +775,7 @@ class FolderShare {
 		}
 
 		setProgressVerifying(progressId, "upload")
-		const fileData = await file.arrayBuffer()
-		const hmac = await computeHMAC(hmacKey, new Uint8Array(fileData))
+		const hmac = await computeHMAC(hmacKey, fileData)
 
 		for (const [, pc] of this.peers) {
 			await pc.send({
