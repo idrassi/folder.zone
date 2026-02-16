@@ -1,12 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Nadim Kobeissi <nadim@symbolic.software>
 
-import {
-	hmac
-} from "@noble/hashes/hmac"
-import {
-	sha256
-} from "@noble/hashes/sha256"
+const HMAC_INFO = new TextEncoder().encode("file-hmac")
+const CHUNK_HMAC_INFO = new TextEncoder().encode("file-hmac-chunk-v1")
+const FINAL_HMAC_INFO = new TextEncoder().encode("file-hmac-final-v1")
+export const HMAC_SIZE = 32
+
+function toUint8Array(data) {
+	if (data instanceof Uint8Array) {
+		return data
+	}
+	if (data instanceof ArrayBuffer) {
+		return new Uint8Array(data)
+	}
+	if (ArrayBuffer.isView(data)) {
+		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+	}
+	throw new TypeError("Expected ArrayBuffer or typed array")
+}
+
+function concatUint8Arrays(parts) {
+	let totalLength = 0
+	for (const part of parts) {
+		totalLength += part.length
+	}
+	const result = new Uint8Array(totalLength)
+	let offset = 0
+	for (const part of parts) {
+		result.set(part, offset)
+		offset += part.length
+	}
+	return result
+}
 
 export function bufferToBase64(buffer) {
 	const bytes = new Uint8Array(buffer)
@@ -29,31 +54,24 @@ export function base64ToBuffer(base64) {
 	return bytes
 }
 
-const HMAC_INFO = new TextEncoder().encode("file-hmac")
-
-function timingSafeEqual(a, b) {
-	if (a.length !== b.length) {
-		return false
+function buildChunkHMACInput(chunkIndex, totalChunks, chunkData) {
+	if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+		throw new Error(`Invalid chunk index: ${chunkIndex}`)
 	}
-	let diff = 0
-	for (let i = 0; i < a.length; i++) {
-		diff |= a[i] ^ b[i]
+	if (!Number.isInteger(totalChunks) || totalChunks < 1) {
+		throw new Error(`Invalid total chunks: ${totalChunks}`)
 	}
-	return diff === 0
+	const chunkBytes = toUint8Array(chunkData)
+	const header = new Uint8Array(12)
+	const view = new DataView(header.buffer)
+	view.setUint32(0, chunkIndex, true)
+	view.setUint32(4, totalChunks, true)
+	view.setUint32(8, chunkBytes.length, true)
+	return concatUint8Arrays([CHUNK_HMAC_INFO, header, chunkBytes])
 }
 
-export function createHMAC(keyBytes) {
-	const hmacState = hmac.create(sha256, keyBytes)
-	hmacState.final = () => hmacState.digest()
-	return hmacState
-}
-
-export function verifyHMACBytes(actualBytes, expectedHMAC) {
-	const expectedBytes = base64ToBuffer(expectedHMAC)
-	if (expectedBytes.length !== 32 || actualBytes.length !== 32) {
-		return false
-	}
-	return timingSafeEqual(actualBytes, expectedBytes)
+export function buildFinalHMACInput(chunkTags) {
+	return concatUint8Arrays([FINAL_HMAC_INFO, toUint8Array(chunkTags)])
 }
 
 export async function generateKey() {
@@ -116,30 +134,40 @@ export function generateNonce() {
 	return bufferToBase64(bytes)
 }
 
-export async function deriveHMACKeyBytes(sessionKey, nonce) {
+export async function deriveHMACKey(sessionKey, nonce) {
 	const sessionKeyBytes = await crypto.subtle.exportKey("raw", sessionKey)
 	const nonceBytes = base64ToBuffer(nonce)
 	const keyMaterial = await crypto.subtle.importKey("raw", sessionKeyBytes, {
 		name: "HKDF"
-	}, false, ["deriveBits"])
+	}, false, ["deriveKey"])
 
-	const bits = await crypto.subtle.deriveBits({
+	return crypto.subtle.deriveKey({
 		name: "HKDF",
 		hash: "SHA-256",
 		salt: nonceBytes,
 		info: HMAC_INFO
-	}, keyMaterial, 256)
-	return new Uint8Array(bits)
+	}, keyMaterial, {
+		name: "HMAC",
+		hash: "SHA-256",
+		length: 256
+	}, false, ["sign", "verify"])
 }
 
-export function computeHMAC(keyBytes, data) {
-	const hmac = createHMAC(keyBytes)
-	hmac.update(data)
-	return bufferToBase64(hmac.final())
+export async function computeChunkHMACTag(hmacKey, chunkIndex, totalChunks, chunkData) {
+	const input = buildChunkHMACInput(chunkIndex, totalChunks, chunkData)
+	const signature = await crypto.subtle.sign("HMAC", hmacKey, input)
+	return new Uint8Array(signature)
 }
 
-export function verifyHMAC(keyBytes, data, expectedHMAC) {
-	const hmac = createHMAC(keyBytes)
-	hmac.update(data)
-	return verifyHMACBytes(hmac.final(), expectedHMAC)
+export async function computeHMAC(hmacKey, data) {
+	const hmac = await crypto.subtle.sign("HMAC", hmacKey, toUint8Array(data))
+	return bufferToBase64(new Uint8Array(hmac))
+}
+
+export async function verifyHMAC(hmacKey, data, expectedHMAC) {
+	const expectedBytes = base64ToBuffer(expectedHMAC)
+	if (expectedBytes.length !== HMAC_SIZE) {
+		return false
+	}
+	return crypto.subtle.verify("HMAC", hmacKey, expectedBytes, toUint8Array(data))
 }
