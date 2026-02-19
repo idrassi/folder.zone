@@ -7,8 +7,11 @@ import {
 	generateRoomId,
 	generateNonce,
 	deriveHMACKey,
+	computeChunkHMACTag,
+	buildFinalHMACInput,
 	computeHMAC,
-	verifyHMAC
+	verifyHMAC,
+	HMAC_SIZE
 } from "./crypto.js"
 import {
 	Signaling
@@ -50,6 +53,22 @@ import {
 	setProgressVerified,
 	removeProgressItem
 } from "./ui.js"
+
+async function buildTransferChunkTags(hmacKey, chunks, totalChunks) {
+	if (!Number.isInteger(totalChunks) || totalChunks < 1) {
+		throw new Error(`Invalid chunk count: ${totalChunks}`)
+	}
+	const chunkTags = new Uint8Array(totalChunks * HMAC_SIZE)
+	for (let i = 0; i < totalChunks; i++) {
+		const chunk = chunks[i]
+		if (!(chunk instanceof Uint8Array)) {
+			throw new Error(`Missing chunk ${i + 1} of ${totalChunks}`)
+		}
+		const chunkTag = await computeChunkHMACTag(hmacKey, i, totalChunks, chunk)
+		chunkTags.set(chunkTag, i * HMAC_SIZE)
+	}
+	return chunkTags
+}
 
 class FolderShare {
 	constructor() {
@@ -376,6 +395,9 @@ class FolderShare {
 			case "file-request":
 				await this.handleFileRequest(peerId, msg.path)
 				break
+			case "file-start":
+				await this.handleFileStart(msg)
+				break
 			case "file-chunk":
 				this.handleFileChunk(msg)
 				break
@@ -383,7 +405,7 @@ class FolderShare {
 				await this.handleFileComplete(msg)
 				break
 			case "upload-start":
-				this.handleUploadStart(peerId, msg)
+				await this.handleUploadStart(peerId, msg)
 				break
 			case "upload-chunk":
 				this.handleUploadChunk(peerId, msg)
@@ -508,15 +530,24 @@ class FolderShare {
 			const nonce = generateNonce()
 			const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
 			const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
+			const chunkTags = new Uint8Array(totalChunks * HMAC_SIZE)
+			await pc.send({
+				type: "file-start",
+				path,
+				size: file.size,
+				totalChunks,
+				nonce,
+			})
 			for (let i = 0; i < totalChunks; i++) {
 				const start = i * CHUNK_SIZE
 				const end = Math.min(start + CHUNK_SIZE, file.size)
-				const chunk = await file.slice(start, end).arrayBuffer()
+				const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer())
+				const chunkTag = await computeChunkHMACTag(hmacKey, i, totalChunks, chunk)
+				chunkTags.set(chunkTag, i * HMAC_SIZE)
 				await pc.sendChunk(path, i, totalChunks, chunk)
 				await new Promise((r) => setTimeout(r, 0))
 			}
-			const fileData = await file.arrayBuffer()
-			const hmac = await computeHMAC(hmacKey, new Uint8Array(fileData))
+			const hmacValue = await computeHMAC(hmacKey, buildFinalHMACInput(chunkTags))
 
 			pc.send({
 				type: "file-complete",
@@ -524,17 +555,29 @@ class FolderShare {
 				name: file.name,
 				size: file.size,
 				nonce,
-				hmac,
+				hmac: hmacValue,
 			})
 		} catch (e) {
 			console.error("Error sending file:", e)
 		}
 	}
 
+	async handleFileStart(msg) {
+		const download = this.pendingDownloads.get(msg.path)
+		if (!download) {
+			console.warn(`Received file start for unknown download: ${msg.path}`)
+			return
+		}
+		if (typeof msg.totalChunks === "number") {
+			download.total = msg.totalChunks
+		}
+	}
+
 	handleFileChunk(msg) {
 		const download = this.pendingDownloads.get(msg.path)
 		if (download) {
-			download.chunks[msg.index] = msg.data
+			const chunkData = msg.data
+			download.chunks[msg.index] = chunkData
 			download.total = msg.total
 			download.received++
 			const progress = (download.received / download.total) * 100
@@ -552,8 +595,8 @@ class FolderShare {
 				if (msg.nonce && msg.hmac) {
 					setProgressVerifying(download.progressId, "download")
 					const hmacKey = await deriveHMACKey(this.cryptoKey, msg.nonce)
-					const fileData = await blob.arrayBuffer()
-					const isValid = await verifyHMAC(hmacKey, fileData, msg.hmac)
+					const chunkTags = await buildTransferChunkTags(hmacKey, download.chunks, download.total)
+					const isValid = await verifyHMAC(hmacKey, buildFinalHMACInput(chunkTags), msg.hmac)
 					if (!isValid) {
 						setProgressVerified(download.progressId, false, "download")
 						showError("File integrity check failed - the file may have been corrupted during transfer")
@@ -581,7 +624,7 @@ class FolderShare {
 		}
 	}
 
-	handleUploadStart(peerId, msg) {
+	async handleUploadStart(peerId, msg) {
 		if (!this.allowWrite) {
 			this.sendUploadResponse(peerId, msg.path, false, "Write access disabled")
 			return
@@ -665,23 +708,18 @@ class FolderShare {
 		}
 		if (upload.timeout) clearTimeout(upload.timeout)
 		try {
-			const totalSize = upload.chunks.reduce((sum, c) => sum + c.length, 0)
-			const combined = new Uint8Array(totalSize)
-			let offset = 0
-			for (const chunk of upload.chunks) {
-				combined.set(chunk, offset)
-				offset += chunk.length
-			}
 			if (msg.nonce && msg.hmac) {
 				const hmacKey = await deriveHMACKey(this.cryptoKey, msg.nonce)
-				const isValid = await verifyHMAC(hmacKey, combined, msg.hmac)
+				const chunkTags = await buildTransferChunkTags(hmacKey, upload.chunks, upload.total)
+				const isValid = await verifyHMAC(hmacKey, buildFinalHMACInput(chunkTags), msg.hmac)
 				if (!isValid) {
 					this.sendUploadResponse(peerId, msg.path, false, "Integrity check failed", progressId)
 					this.pendingUploads.delete(key)
 					return
 				}
 			}
-			await writeFile(this.dirHandle, upload.path, combined)
+			const blob = new Blob(upload.chunks)
+			await writeFile(this.dirHandle, upload.path, blob)
 			this.sendUploadResponse(peerId, msg.path, true, "Upload complete", progressId)
 			await this.updateFileList()
 		} catch (e) {
@@ -732,6 +770,9 @@ class FolderShare {
 		const progressId = `${path.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`
 		createProgressItem(progressId, path.split("/").pop(), file.size, "upload")
 		const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
+		const nonce = generateNonce()
+		const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
+		const chunkTags = new Uint8Array(totalChunks * HMAC_SIZE)
 		for (const [, pc] of this.peers) {
 			await pc.send({
 				type: "upload-start",
@@ -739,14 +780,15 @@ class FolderShare {
 				size: file.size,
 				totalChunks,
 				progressId,
+				nonce,
 			})
 		}
-		const nonce = generateNonce()
-		const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
 		for (let i = 0; i < totalChunks; i++) {
 			const start = i * CHUNK_SIZE
 			const end = Math.min(start + CHUNK_SIZE, file.size)
 			const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer())
+			const chunkTag = await computeChunkHMACTag(hmacKey, i, totalChunks, chunk)
+			chunkTags.set(chunkTag, i * HMAC_SIZE)
 			for (const [, pc] of this.peers) {
 				await pc.sendUploadChunk(path, i, totalChunks, chunk)
 			}
@@ -755,15 +797,14 @@ class FolderShare {
 		}
 
 		setProgressVerifying(progressId, "upload")
-		const fileData = await file.arrayBuffer()
-		const hmac = await computeHMAC(hmacKey, new Uint8Array(fileData))
+		const hmacValue = await computeHMAC(hmacKey, buildFinalHMACInput(chunkTags))
 
 		for (const [, pc] of this.peers) {
 			await pc.send({
 				type: "upload-complete",
 				path,
 				nonce,
-				hmac,
+				hmac: hmacValue,
 				progressId,
 			})
 		}
