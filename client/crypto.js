@@ -120,7 +120,7 @@ export async function decrypt(key, data) {
 }
 
 export function generateRoomId() {
-	const bytes = crypto.getRandomValues(new Uint8Array(8))
+	const bytes = crypto.getRandomValues(new Uint8Array(16))
 	return bufferToBase64(bytes)
 }
 

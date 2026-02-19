@@ -86,6 +86,7 @@ class FolderShare {
 		this.uploadRateLimiter = new RateLimiter(UPLOAD_LIMITS.rateLimitPerMinute)
 		this.downloadRateLimiter = new RateLimiter(DOWNLOAD_RATE_LIMIT)
 		this.pendingUploads = new Map()
+		this.lastFileListJson = ""
 		this.init()
 	}
 
@@ -263,11 +264,15 @@ class FolderShare {
 		renderHostFiles(this.files, this.currentPath, (p) => this.navigateTo(p))
 		updateBreadcrumb("breadcrumb", this.folderName, this.currentPath, (p) => this.navigateTo(p))
 		updateStatusText("status-text", `Sharing: ${this.folderName}`)
-		this.broadcastFileList()
+		const fileListJson = JSON.stringify(this.files)
+		if (fileListJson !== this.lastFileListJson) {
+			this.lastFileListJson = fileListJson
+			this.broadcastFileList()
+		}
 	}
 
 	watchFolder() {
-		setInterval(() => this.updateFileList(), 5000)
+		this.watchInterval = setInterval(() => this.updateFileList(), 5000)
 	}
 
 	copyLink() {
@@ -433,6 +438,21 @@ class FolderShare {
 		}
 	}
 
+	_startDownloadTimeout(path) {
+		const dl = this.pendingDownloads.get(path)
+		if (!dl) return
+		if (dl.timeout) clearTimeout(dl.timeout)
+		dl.timeout = setTimeout(() => {
+			const download = this.pendingDownloads.get(path)
+			if (download) {
+				removeProgressItem(download.progressId, "download")
+				this.pendingDownloads.delete(path)
+				showError(`Download timed out: ${path.split("/").pop()}`)
+				if (download.onComplete) download.onComplete()
+			}
+		}, 5 * 60 * 1000)
+	}
+
 	requestFile(path) {
 		const file = this.files.find((f) => f.path === path)
 		if (file && file.size > MAX_FILE_SIZE) {
@@ -454,6 +474,7 @@ class FolderShare {
 			total: 0,
 			progressId,
 		})
+		this._startDownloadTimeout(path)
 	}
 
 	async downloadFolder(folderPath) {
@@ -504,6 +525,7 @@ class FolderShare {
 			progressId,
 			onComplete,
 		})
+		this._startDownloadTimeout(path)
 	}
 
 	async handleFileRequest(peerId, path) {
@@ -559,6 +581,7 @@ class FolderShare {
 			download.chunks[msg.index] = chunkData
 			download.total = msg.total
 			download.received++
+			this._startDownloadTimeout(msg.path)
 			const progress = (download.received / download.total) * 100
 			updateProgressItem(download.progressId, progress, "download")
 		} else {
@@ -569,6 +592,7 @@ class FolderShare {
 	async handleFileComplete(msg) {
 		const download = this.pendingDownloads.get(msg.path)
 		if (download && download.received === download.total) {
+			if (download.timeout) clearTimeout(download.timeout)
 			try {
 				const blob = new Blob(download.chunks)
 				if (msg.nonce && msg.hmac) {

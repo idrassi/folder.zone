@@ -40,10 +40,19 @@ export class RateLimiter {
 	constructor(maxPerMinute) {
 		this.maxPerMinute = maxPerMinute
 		this.requests = new Map()
+		this.lastCleanup = 0
 	}
 	isAllowed(peerId) {
 		const now = Date.now()
 		const minute = 60 * 1000
+		if (now - this.lastCleanup > minute) {
+			this.lastCleanup = now
+			for (const [id, timestamps] of this.requests) {
+				if (timestamps.length === 0 || now - timestamps[timestamps.length - 1] >= minute) {
+					this.requests.delete(id)
+				}
+			}
+		}
 		if (!this.requests.has(peerId)) {
 			this.requests.set(peerId, [])
 		}

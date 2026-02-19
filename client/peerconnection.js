@@ -25,7 +25,7 @@ export class PeerConnection {
 		this.useRelay = false
 		this.connected = false
 		this.sendQueue = []
-		this.pendingSend = null
+		this.pendingSends = new Set()
 		this.webrtcVerified = false
 		this.jsonChunkBuffers = new Map()
 		this.nextJsonMessageId = 0
@@ -103,10 +103,11 @@ export class PeerConnection {
 			this.switchToRelay()
 		}
 		this.channel.onerror = () => {
-			if (this.pendingSend) {
-				this.signaling.sendBinaryRelay(this.peerId, this.pendingSend)
-				this.pendingSend = null
+			for (const entry of this.pendingSends) {
+				this.signaling.sendBinaryRelay(this.peerId, entry.data)
+				entry.relayed = true
 			}
+			this.pendingSends.clear()
 			this.switchToRelay()
 		}
 		this.channel.onbufferedamountlow = () => {
@@ -317,11 +318,16 @@ export class PeerConnection {
 		const encrypted = await encrypt(this.cryptoKey, data)
 		if (!this.useRelay && this.channel && this.channel.readyState === "open") {
 			if (this.channel.bufferedAmount <= WEBRTC_BUFFER_THRESHOLD) {
-				this.pendingSend = encrypted
+				const entry = {
+					data: encrypted,
+					relayed: false
+				}
+				this.pendingSends.add(entry)
 				this.channel.send(encrypted)
 				const waitTime = this.webrtcVerified ? 0 : 10
 				await new Promise((r) => setTimeout(r, waitTime))
-				if (this.pendingSend === null) {
+				this.pendingSends.delete(entry)
+				if (entry.relayed) {
 					return
 				}
 				if (!this.useRelay && this.channel && this.channel.readyState === "open") {
@@ -330,7 +336,6 @@ export class PeerConnection {
 					}
 					return
 				}
-				this.pendingSend = null
 				await this.signaling.sendBinaryRelay(this.peerId, encrypted)
 				return
 			} else {
