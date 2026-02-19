@@ -395,9 +395,6 @@ class FolderShare {
 			case "file-request":
 				await this.handleFileRequest(peerId, msg.path)
 				break
-			case "file-start":
-				await this.handleFileStart(msg)
-				break
 			case "file-chunk":
 				this.handleFileChunk(msg)
 				break
@@ -405,7 +402,7 @@ class FolderShare {
 				await this.handleFileComplete(msg)
 				break
 			case "upload-start":
-				await this.handleUploadStart(peerId, msg)
+				this.handleUploadStart(peerId, msg)
 				break
 			case "upload-chunk":
 				this.handleUploadChunk(peerId, msg)
@@ -531,13 +528,6 @@ class FolderShare {
 			const hmacKey = await deriveHMACKey(this.cryptoKey, nonce)
 			const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
 			const chunkTags = new Uint8Array(totalChunks * HMAC_SIZE)
-			await pc.send({
-				type: "file-start",
-				path,
-				size: file.size,
-				totalChunks,
-				nonce,
-			})
 			for (let i = 0; i < totalChunks; i++) {
 				const start = i * CHUNK_SIZE
 				const end = Math.min(start + CHUNK_SIZE, file.size)
@@ -559,17 +549,6 @@ class FolderShare {
 			})
 		} catch (e) {
 			console.error("Error sending file:", e)
-		}
-	}
-
-	async handleFileStart(msg) {
-		const download = this.pendingDownloads.get(msg.path)
-		if (!download) {
-			console.warn(`Received file start for unknown download: ${msg.path}`)
-			return
-		}
-		if (typeof msg.totalChunks === "number") {
-			download.total = msg.totalChunks
 		}
 	}
 
@@ -624,7 +603,7 @@ class FolderShare {
 		}
 	}
 
-	async handleUploadStart(peerId, msg) {
+	handleUploadStart(peerId, msg) {
 		if (!this.allowWrite) {
 			this.sendUploadResponse(peerId, msg.path, false, "Write access disabled")
 			return
@@ -780,7 +759,6 @@ class FolderShare {
 				size: file.size,
 				totalChunks,
 				progressId,
-				nonce,
 			})
 		}
 		for (let i = 0; i < totalChunks; i++) {
